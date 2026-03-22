@@ -1,21 +1,30 @@
 """
-SHEIN Sheinverse Product Alert Bot — v16 (Fixed)
-=================================================
-FIXES:
-  - Pages are 0-indexed (page 0 = first page) ✓
-  - variantOptions missing from listing API → treat listed product as inStock ✓
-  - _run_first_cycle now has full error handling so fc_done always gets set ✓
-  - ALERT_GROUP_ID properly included in all alert destinations ✓
-  - Restock detection works even without per-size variant data ✓
+SHEIN Sheinverse Product Alert Bot — v17
+=========================================
+WHAT'S NEW IN v17:
+  - Real per-size stock detection via HTML page scraping ✓
+  - Parses window.__PRELOADED_STATE__ from product page HTML ✓
+  - Shows actual sizes in alerts (XS, S, M, L, XL, XXL) ✓
+  - HTML only fetched for NEW products — cycles stay fast ✓
+  - Restock alert fetches HTML for accurate sizes ✓
+  - Disappeared products marked OOS → reappearance fires restock ✓
+  - Min interval warning if < 60s ✓
+  - All v16 fixes preserved ✓
+
+HOW IT WORKS:
+  1. Listing API → all products fast (JSON, no size data)
+  2. NEW products only → fetch HTML → parse __PRELOADED_STATE__
+  3. Extract variantOptions with real stockLevelStatus per size
+  4. Show sizes like: XS • S • M • L in alert messages
 
 ENV VARS REQUIRED:
   BOT_TOKEN        - Telegram bot token
   ADMIN_USER_ID    - Your Telegram user ID (numeric)
-  ALERT_GROUP_ID   - Your group chat ID e.g. -1001234567890  ← REQUIRED for group alerts
 
 ENV VARS OPTIONAL:
   ALERT_CHANNEL_1  - default @shein30sec
   ALERT_CHANNEL_2  - default @helpinghands2s
+  ALERT_GROUP_ID   - Your group chat ID e.g. -1001234567890
 """
 
 import os
@@ -65,9 +74,12 @@ if _group_id:
     ALERT_CHANNELS.append(_group_id)
 
 # ── FETCH SETTINGS ────────────────────────────────────────────────────────────
-PAGE_SIZE     = 45
-FETCH_WORKERS = 8
-PAGE_RETRIES  = 3
+PAGE_SIZE          = 45
+FETCH_WORKERS      = 8
+PAGE_RETRIES       = 3
+HTML_FETCH_WORKERS = 8    # parallel workers for product HTML scraping
+HTML_TIMEOUT       = 20   # seconds per HTML page
+MIN_INTERVAL       = 60   # warn if interval set below this
 
 # ── STOCK STATUSES ────────────────────────────────────────────────────────────
 _IN_STOCK_STATUSES = {"inStock", "lowStock"}
@@ -129,14 +141,16 @@ _state = {
 
     "last_poll_time":       None,
     "last_listing_secs":    0.0,
+    "last_html_secs":       0.0,
     "last_total_products":  0,
     "last_new_alerted":     0,
     "last_restock_alerted": 0,
+    "last_html_fetched":    0,
 }
 
 _monitor_task: asyncio.Task | None = None
 
-# ── HTTP SESSION ──────────────────────────────────────────────────────────────
+# ── HTTP SESSION — Listing API (JSON) ────────────────────────────────────────
 _http = requests.Session()
 _http.mount("https://", requests.adapters.HTTPAdapter(
     pool_connections=40, pool_maxsize=40, max_retries=2,
@@ -157,6 +171,25 @@ _http.headers.update({
     "sec-fetch-dest":   "empty",
     "sec-fetch-mode":   "cors",
     "sec-fetch-site":   "same-origin",
+})
+
+# ── HTTP SESSION — Product HTML scraping ──────────────────────────────────────
+_html_http = requests.Session()
+_html_http.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=40, pool_maxsize=40, max_retries=2,
+))
+_html_http.headers.update({
+    "user-agent":       (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/146.0.0.0 Safari/537.36"
+    ),
+    "accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language":  "en-US,en;q=0.9",
+    "accept-encoding":  "gzip, deflate, br",
+    "sec-fetch-dest":   "document",
+    "sec-fetch-mode":   "navigate",
+    "referer":          "https://www.sheinindia.in/c/sverse-5939-37961",
 })
 
 # =============================================================================
@@ -261,22 +294,158 @@ def _fetch_all_products(sort_mode: str) -> tuple[list | None, str | None]:
 
 
 # =============================================================================
-# STOCK EXTRACTION
-# NOTE: The listing API does NOT return variantOptions with stock data.
-#       A product appearing in the listing means it IS available.
-#       We treat all listed products as inStock.
+# HTML PAGE SCRAPING — real size/stock data from __PRELOADED_STATE__
 # =============================================================================
 
-def _get_variant_stock_map(product: dict) -> dict[str, str]:
+def _fetch_product_html_details(url_path: str) -> dict | None:
     """
-    Returns {size_label: stockLevelStatus}.
-    If no variant data (common for listing API), returns a sentinel
-    indicating the product is listed/available.
+    Fetch product HTML page, extract window.__PRELOADED_STATE__,
+    return productDetails dict (which has variantOptions with real stock).
+    """
+    url = BASE_URL + url_path
+    try:
+        r = _html_http.get(url, timeout=HTML_TIMEOUT)
+        if r.status_code != 200:
+            print(f"{YELLOW}[html] HTTP {r.status_code} for {url_path}{RESET}")
+            return None
+
+        html = r.text
+
+        # Find window.__PRELOADED_STATE__ = { ... };
+        match = re.search(
+            r"window\.__PRELOADED_STATE__\s*=\s*(\{)",
+            html,
+        )
+        if not match:
+            print(f"{YELLOW}[html] __PRELOADED_STATE__ not found for {url_path}{RESET}")
+            return None
+
+        start = match.start(1)
+
+        # Walk the string to find the matching closing brace
+        depth   = 0
+        end_pos = start
+        in_str  = False
+        escape  = False
+        for i in range(start, len(html)):
+            ch = html[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_str:
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_str = not in_str
+            if not in_str:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i + 1
+                        break
+
+        raw   = html[start:end_pos]
+        state = json.loads(raw)
+        return state.get("product", {}).get("productDetails", {})
+
+    except json.JSONDecodeError as exc:
+        print(f"{YELLOW}[html] JSON error for {url_path}: {exc}{RESET}")
+        return None
+    except Exception as exc:
+        print(f"{RED}[html] Error for {url_path}: {exc}{RESET}")
+        return None
+
+
+def _extract_stock_map_from_details(details: dict) -> dict[str, str]:
+    """
+    Extract {size_label: stockLevelStatus} from productDetails.variantOptions.
+    variantOptions has per-size real stock data with scDisplaySize labels.
     """
     stock_map: dict[str, str] = {}
-    variants = product.get("variantOptions", []) or product.get("variants", [])
 
+    # Primary: variantOptions — has real per-size stock
+    variant_options = details.get("variantOptions", [])
+    if variant_options:
+        for variant in variant_options:
+            status = variant.get("stock", {}).get("stockLevelStatus", "outOfStock")
+            label  = variant.get("scDisplaySize", "").strip()
+            if not label:
+                for q in variant.get("variantOptionQualifiers", []):
+                    if str(q.get("qualifier", "")).lower() == "size":
+                        label = str(q.get("value", "")).strip()
+                        break
+            if label:
+                stock_map[label] = status
+        return stock_map
+
+    # Fallback: top-level stock
+    top_status = details.get("stock", {}).get("stockLevelStatus", "outOfStock")
+    stock_map["__product__"] = top_status
+    return stock_map
+
+
+def _fetch_real_stock_map(product: dict) -> dict[str, str]:
+    """
+    Fetch and return a real stock map for a product via HTML scraping.
+    Falls back to listing sentinel if HTML fetch fails.
+    """
+    url_path = product.get("url", "").strip()
+    if not url_path:
+        return {"__listed__": "inStock"}
+
+    details = _fetch_product_html_details(url_path)
+    if not details:
+        return {"__listed__": "inStock"}
+
+    stock_map = _extract_stock_map_from_details(details)
+    return stock_map if stock_map else {"__listed__": "inStock"}
+
+
+def _fetch_real_stock_maps_parallel(products: list[dict]) -> dict[str, dict[str, str]]:
+    """
+    Fetch real stock maps for a list of products in parallel.
+    Returns {product_code: stock_map}.
+    """
+    results: dict[str, dict[str, str]] = {}
+    if not products:
+        return results
+
+    with ThreadPoolExecutor(max_workers=HTML_FETCH_WORKERS) as pool:
+        future_to_code = {
+            pool.submit(_fetch_real_stock_map, p): p.get("code", "")
+            for p in products
+            if p.get("code") and p.get("url")
+        }
+        for future in as_completed(future_to_code):
+            code = future_to_code[future]
+            try:
+                stock_map = future.result()
+                results[code] = stock_map
+                real = {k: v for k, v in stock_map.items() if not k.startswith("__")}
+                in_s = [k for k, v in real.items() if v in _IN_STOCK_STATUSES]
+                print(f"{GREEN}[html] {code}: sizes={list(real.keys())} in_stock={in_s}{RESET}")
+            except Exception as exc:
+                print(f"{RED}[html] {code} exception: {exc}{RESET}")
+                results[code] = {"__listed__": "inStock"}
+
+    return results
+
+
+# =============================================================================
+# LISTING-ONLY STOCK MAP (fallback when HTML fails)
+# =============================================================================
+
+def _get_variant_stock_map_from_listing(product: dict) -> dict[str, str]:
+    """
+    Extract stock map from listing API data.
+    Listing API normally has NO variantOptions — returns sentinel.
+    Product appearing in listing = available.
+    """
+    variants = product.get("variantOptions", []) or product.get("variants", [])
     if variants:
+        stock_map: dict[str, str] = {}
         for variant in variants:
             status = variant.get("stock", {}).get("stockLevelStatus", "outOfStock")
             label  = variant.get("scDisplaySize", "").strip()
@@ -285,49 +454,11 @@ def _get_variant_stock_map(product: dict) -> dict[str, str]:
                     if str(q.get("qualifier", "")).lower() == "size":
                         label = str(q.get("value", "")).strip()
                         break
-            if not label:
-                label = variant.get("size", "").strip()
             if label:
                 stock_map[label] = status
-        return stock_map
-
-    # No variant data in listing API response.
-    # The product being listed means it's available for purchase.
-    stock_map["__listed__"] = "inStock"
-    return stock_map
-
-
-def _get_product_sizes_from_data(product: dict) -> tuple[list[str], list[str]]:
-    """
-    Returns (in_stock_sizes, all_sizes).
-    If no variant data, returns (["Available"], ["Available"]) since
-    the product appears in listing = available.
-    """
-    in_stock: list[str] = []
-    all_sizes: list[str] = []
-
-    variants = product.get("variantOptions", []) or product.get("variants", [])
-
-    if variants:
-        for variant in variants:
-            stock_status = variant.get("stock", {}).get("stockLevelStatus", "outOfStock")
-            label = variant.get("scDisplaySize", "").strip()
-            if not label:
-                for q in variant.get("variantOptionQualifiers", []):
-                    if str(q.get("qualifier", "")).lower() == "size":
-                        label = str(q.get("value", "")).strip()
-                        break
-            if not label:
-                label = variant.get("size", "").strip()
-            if label and label not in all_sizes:
-                all_sizes.append(label)
-            if stock_status in _IN_STOCK_STATUSES:
-                if label and label not in in_stock:
-                    in_stock.append(label)
-        return in_stock, all_sizes
-
-    # No variant data → product is listed = available
-    return ["Available"], ["Available"]
+        if stock_map:
+            return stock_map
+    return {"__listed__": "inStock"}
 
 
 # =============================================================================
@@ -349,15 +480,28 @@ def _get_product_image(product: dict) -> str | None:
     return images[0].get("url") if images else None
 
 
+# Natural clothing size order
+_SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL", "3XL", "4XL"]
+
+def _sort_sizes(sizes: list[str]) -> list[str]:
+    def key(s):
+        try:
+            return (_SIZE_ORDER.index(s.upper()), s)
+        except ValueError:
+            return (99, s)
+    return sorted(sizes, key=key)
+
+
 def _fmt_sizes(sizes: list[str]) -> str:
     if not sizes:
         return "—"
-    # Filter out internal sentinel values
     display = [s for s in sizes if not s.startswith("__")]
-    return ", ".join(sorted(display)) if display else "Check site"
+    if not display:
+        return "Check site"
+    return " • ".join(_sort_sizes(display))
 
 
-def _format_new_alert(product: dict, sizes: list[str]) -> str:
+def _format_new_alert(product: dict, stock_map: dict[str, str]) -> str:
     name     = product.get("name", "Unknown Product")
     segment  = product.get("segmentNameText", "")
     brick    = product.get("brickNameText", "")
@@ -368,8 +512,10 @@ def _format_new_alert(product: dict, sizes: list[str]) -> str:
     offer    = product.get("offerPrice", {}).get("displayformattedValue", "")
     url      = BASE_URL + _get_product_url(product)
 
-    # Filter sentinel sizes for display
-    display_sizes = [s for s in sizes if s not in ("Available", "__listed__")]
+    in_stock_sizes = [
+        s for s, st in stock_map.items()
+        if st in _IN_STOCK_STATUSES and not s.startswith("__")
+    ]
 
     lines = [
         "✨🆕 *NEW ARRIVAL — SHEINVERSE!* 🛍️✨", "",
@@ -384,8 +530,8 @@ def _format_new_alert(product: dict, sizes: list[str]) -> str:
     if offer and offer != price:
         lines.append(f"🎟️ With coupon: *{offer}*")
 
-    if display_sizes:
-        lines.append(f"📐 Sizes in stock: `{_fmt_sizes(display_sizes)}`")
+    if in_stock_sizes:
+        lines.append(f"📐 Sizes in stock: `{_fmt_sizes(in_stock_sizes)}`")
     else:
         lines.append("📐 Sizes: Check site for availability")
 
@@ -393,7 +539,7 @@ def _format_new_alert(product: dict, sizes: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _format_restock_alert(product: dict, restocked_sizes: list[str]) -> str:
+def _format_restock_alert(product: dict, stock_map: dict[str, str]) -> str:
     name     = product.get("name", "Unknown Product")
     segment  = product.get("segmentNameText", "")
     brick    = product.get("brickNameText", "")
@@ -404,7 +550,10 @@ def _format_restock_alert(product: dict, restocked_sizes: list[str]) -> str:
     offer    = product.get("offerPrice", {}).get("displayformattedValue", "")
     url      = BASE_URL + _get_product_url(product)
 
-    display_sizes = [s for s in restocked_sizes if s not in ("Available", "__listed__")]
+    in_stock_sizes = [
+        s for s, st in stock_map.items()
+        if st in _IN_STOCK_STATUSES and not s.startswith("__")
+    ]
 
     lines = [
         "🚀🔄 *BACK IN STOCK — ACT FAST!* 🎉🔥", "",
@@ -419,8 +568,8 @@ def _format_restock_alert(product: dict, restocked_sizes: list[str]) -> str:
     if offer and offer != price:
         lines.append(f"🎟️ With coupon: *{offer}*")
 
-    if display_sizes:
-        lines.append(f"✅ Sizes now available: `{_fmt_sizes(display_sizes)}`")
+    if in_stock_sizes:
+        lines.append(f"✅ Sizes now available: `{_fmt_sizes(in_stock_sizes)}`")
     else:
         lines.append("✅ Back in stock — check site for sizes")
 
@@ -517,7 +666,8 @@ def _is_admin(uid: int) -> bool:
 async def _run_first_cycle(app: Application, products: list[dict]):
     """
     Seed snapshot and send alerts for all in-stock products.
-    ALWAYS sets fc_done=True at the end, even if errors occur.
+    Fetches real size data via HTML scraping for every product.
+    ALWAYS sets fc_done=True at the end.
     """
     global _stock_snapshot, _alerted_new, _known_codes
 
@@ -525,22 +675,31 @@ async def _run_first_cycle(app: Application, products: list[dict]):
     in_stock_count = 0
     oos_count      = 0
 
-    print(f"{CYAN}[first-cycle] Starting — {total} products to process{RESET}")
+    print(f"{CYAN}[first-cycle] Starting — {total} products | fetching HTML for real sizes...{RESET}")
     t0 = time.monotonic()
 
     try:
+        # Fetch real stock maps for ALL products in parallel via HTML
+        html_t0    = time.monotonic()
+        print(f"{CYAN}[first-cycle] Parallel HTML fetch ({HTML_FETCH_WORKERS} workers)...{RESET}")
+        stock_maps = await asyncio.to_thread(_fetch_real_stock_maps_parallel, products)
+        html_elapsed = time.monotonic() - html_t0
+        _state["last_html_secs"]    = round(html_elapsed, 1)
+        _state["last_html_fetched"] = len(stock_maps)
+        print(f"{GREEN}[first-cycle] HTML done in {html_elapsed:.1f}s — {len(stock_maps)} maps{RESET}")
+
         for i, product in enumerate(products):
             try:
                 code = product.get("code", "")
                 if not code:
-                    print(f"{YELLOW}[first-cycle] Skipping product with no code at index {i}{RESET}")
                     continue
 
                 _known_codes.add(code)
-                stock_map = _get_variant_stock_map(product)
+
+                # Use real HTML stock map, fall back to listing sentinel
+                stock_map = stock_maps.get(code) or _get_variant_stock_map_from_listing(product)
                 _stock_snapshot[code] = stock_map
 
-                # Determine in-stock sizes from the stock map
                 in_stock_sizes = [
                     size for size, status in stock_map.items()
                     if status in _IN_STOCK_STATUSES
@@ -548,18 +707,15 @@ async def _run_first_cycle(app: Application, products: list[dict]):
 
                 name = product.get("name", "?")[:40]
                 if in_stock_sizes:
-                    print(f"{GREEN}[first-cycle] [{i+1}/{total}] IN STOCK: {code} | {name}{RESET}")
-                    caption   = _format_new_alert(product, in_stock_sizes)
+                    real = [s for s in in_stock_sizes if not s.startswith("__")]
+                    print(f"{GREEN}[first-cycle] [{i+1}/{total}] IN STOCK: {code} | {name} | {real or 'available'}{RESET}")
+                    caption   = _format_new_alert(product, stock_map)
                     image_url = _get_product_image(product)
                     sent_ok   = await _send_alert(app, caption, image_url, code)
+                    _alerted_new.add(code)
                     if sent_ok:
-                        _alerted_new.add(code)
                         _state["new_alerts_sent"] += 1
-                        in_stock_count += 1
-                    else:
-                        # Still mark as alerted to avoid duplicates
-                        _alerted_new.add(code)
-                        in_stock_count += 1
+                    in_stock_count += 1
                 else:
                     print(f"{YELLOW}[first-cycle] [{i+1}/{total}] OOS: {code} | {name}{RESET}")
                     _alerted_new.add(code)
@@ -568,7 +724,6 @@ async def _run_first_cycle(app: Application, products: list[dict]):
             except Exception as exc:
                 print(f"{RED}[first-cycle] Error on product index {i}: {exc}{RESET}")
                 traceback.print_exc()
-                # Don't let one product crash the whole cycle
                 continue
 
     except Exception as exc:
@@ -576,7 +731,6 @@ async def _run_first_cycle(app: Application, products: list[dict]):
         traceback.print_exc()
 
     finally:
-        # ALWAYS mark first cycle as done
         elapsed = time.monotonic() - t0
         _state["fc_total"]    = total
         _state["fc_in_stock"] = in_stock_count
@@ -601,11 +755,16 @@ async def _monitor_loop(app: Application):
     _state["monitor_started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _state["is_first_cycle"]  = True
 
-    print(f"{GREEN}[monitor] Started | sort={_state['sort_mode']} interval={_state['interval']}s{RESET}")
+    print(f"{GREEN}[monitor] Started v17 | sort={_state['sort_mode']} interval={_state['interval']}s{RESET}")
     print(f"{GREEN}[monitor] Alert destinations: {ALERT_CHANNELS}{RESET}")
+    print(f"{GREEN}[monitor] HTML scraping: {HTML_FETCH_WORKERS} workers, {HTML_TIMEOUT}s timeout{RESET}")
+
+    if _state["interval"] < MIN_INTERVAL:
+        print(f"{YELLOW}[monitor] WARNING: interval={_state['interval']}s is below {MIN_INTERVAL}s. "
+              f"Recommended 60-300s for HTML scraping.{RESET}")
 
     if not _group_id:
-        print(f"{YELLOW}[monitor] WARNING: ALERT_GROUP_ID not set! Set it to send alerts to your group.{RESET}")
+        print(f"{YELLOW}[monitor] WARNING: ALERT_GROUP_ID not set!{RESET}")
 
     try:
         while True:
@@ -654,32 +813,53 @@ async def _monitor_loop(app: Application):
                     current_map[code] = p
             current_codes = set(current_map.keys())
 
+            # Find brand-new products (never seen before)
+            new_product_codes = [c for c in current_codes if c not in _known_codes]
+
+            # ── HTML FETCH FOR NEW PRODUCTS ───────────────────────────────
+            new_stock_maps: dict[str, dict[str, str]] = {}
+            if new_product_codes:
+                new_products_list = [current_map[c] for c in new_product_codes]
+                print(f"{CYAN}[monitor] {len(new_product_codes)} new products — fetching HTML...{RESET}")
+                html_t0 = time.monotonic()
+                new_stock_maps = await asyncio.to_thread(
+                    _fetch_real_stock_maps_parallel, new_products_list
+                )
+                html_elapsed_inner = time.monotonic() - html_t0
+                _state["last_html_fetched"] = len(new_product_codes)
+                _state["last_html_secs"]    = round(html_elapsed_inner, 1)
+                print(f"{GREEN}[monitor] HTML done in {html_elapsed_inner:.1f}s{RESET}")
+            else:
+                _state["last_html_fetched"] = 0
+                _state["last_html_secs"]    = 0.0
+
             new_alerted     = 0
             restock_alerted = 0
 
             for code, product in current_map.items():
-                new_stock_map = _get_variant_stock_map(product)
                 old_stock_map = _stock_snapshot.get(code, {})
                 is_brand_new  = code not in _known_codes
 
                 if is_brand_new:
-                    # Brand new product never seen before
+                    # ── NEW PRODUCT — use HTML stock map ──────────────────
                     _known_codes.add(code)
-                    _stock_snapshot[code] = new_stock_map
+                    stock_map = new_stock_maps.get(code) or _get_variant_stock_map_from_listing(product)
+                    _stock_snapshot[code] = stock_map
 
                     in_stock_sizes = [
-                        size for size, status in new_stock_map.items()
+                        size for size, status in stock_map.items()
                         if status in _IN_STOCK_STATUSES
                     ]
 
                     if in_stock_sizes:
+                        real = [s for s in in_stock_sizes if not s.startswith("__")]
                         name = product.get("name", "?")[:40]
-                        print(f"{GREEN}[monitor] NEW PRODUCT: {code} | {name}{RESET}")
-                        caption   = _format_new_alert(product, in_stock_sizes)
+                        print(f"{GREEN}[monitor] NEW: {code} | {name} | sizes={real or 'available'}{RESET}")
+                        caption   = _format_new_alert(product, stock_map)
                         image_url = _get_product_image(product)
                         sent_ok   = await _send_alert(app, caption, image_url, code)
+                        _alerted_new.add(code)
                         if sent_ok:
-                            _alerted_new.add(code)
                             _state["new_alerts_sent"] += 1
                             new_alerted += 1
                     else:
@@ -687,44 +867,39 @@ async def _monitor_loop(app: Application):
                         print(f"{YELLOW}[monitor] New but OOS: {code}{RESET}")
 
                 else:
-                    # Known product — check for restock
-                    # A "restock" = key went from NOT in old_map (product disappeared then reappeared)
-                    # OR a size went from outOfStock → inStock
-                    _stock_snapshot[code] = new_stock_map
+                    # ── KNOWN PRODUCT — restock detection ─────────────────
+                    # Update listing sentinel for this cycle
+                    listing_map = _get_variant_stock_map_from_listing(product)
 
-                    if not old_stock_map:
-                        # Was tracked but had no stock data before — now it's back
-                        in_stock_sizes = [
-                            size for size, status in new_stock_map.items()
-                            if status in _IN_STOCK_STATUSES
-                        ]
-                        if in_stock_sizes and code not in _alerted_new:
-                            pass  # Already alerted in first cycle, skip
+                    # Was product OOS (disappeared) and now back?
+                    old_was_oos = old_stock_map and not any(
+                        st in _IN_STOCK_STATUSES for st in old_stock_map.values()
+                    )
+                    now_in_stock = any(
+                        st in _IN_STOCK_STATUSES for st in listing_map.values()
+                    )
+
+                    if old_was_oos and now_in_stock:
+                        # Product is back — fetch real HTML for accurate sizes
+                        name = product.get("name", "?")[:40]
+                        print(f"{GREEN}[monitor] RESTOCK: {code} | {name} — fetching HTML{RESET}")
+                        real_map = await asyncio.to_thread(_fetch_real_stock_map, product)
+                        _stock_snapshot[code] = real_map
+                        caption   = _format_restock_alert(product, real_map)
+                        image_url = _get_product_image(product)
+                        sent_ok   = await _send_alert(app, caption, image_url, code)
+                        if sent_ok:
+                            _state["restock_alerts_sent"] += 1
+                            restock_alerted += 1
                     else:
-                        # Find sizes that went from OOS/missing → inStock
-                        restocked_sizes = []
-                        for size, new_status in new_stock_map.items():
-                            if new_status not in _IN_STOCK_STATUSES:
-                                continue
-                            old_status = old_stock_map.get(size, "outOfStock")
-                            if old_status not in _IN_STOCK_STATUSES:
-                                restocked_sizes.append(size)
+                        # Just update snapshot with listing sentinel
+                        _stock_snapshot[code] = listing_map
 
-                        if restocked_sizes:
-                            name = product.get("name", "?")[:40]
-                            print(f"{GREEN}[monitor] RESTOCK: {code} | {name} | {restocked_sizes}{RESET}")
-                            caption   = _format_restock_alert(product, restocked_sizes)
-                            image_url = _get_product_image(product)
-                            sent_ok   = await _send_alert(app, caption, image_url, code)
-                            if sent_ok:
-                                _state["restock_alerts_sent"] += 1
-                                restock_alerted += 1
-
-            # Remove codes that disappeared from listing
+            # Mark disappeared products as OOS (don't delete — needed for restock detection)
             disappeared = _known_codes - current_codes
             for code in disappeared:
-                _stock_snapshot.pop(code, None)
-                print(f"{YELLOW}[monitor] Removed from listing: {code}{RESET}")
+                _stock_snapshot[code] = {"__listed__": "outOfStock"}
+                print(f"{YELLOW}[monitor] Disappeared: {code} — marked OOS{RESET}")
             _known_codes = current_codes
 
             _state["last_new_alerted"]     = new_alerted
@@ -734,7 +909,7 @@ async def _monitor_loop(app: Application):
                 f"{CYAN}[monitor] Poll #{_state['polls_done']} done | "
                 f"products={len(current_codes)} | "
                 f"new={new_alerted} restock={restock_alerted} | "
-                f"fetch={listing_elapsed:.1f}s{RESET}"
+                f"listing={listing_elapsed:.1f}s html={_state['last_html_secs']}s{RESET}"
             )
 
     except asyncio.CancelledError:
@@ -806,7 +981,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_line  = f"`{_group_id}`" if _group_id else "❌ Not set — set ALERT\\_GROUP\\_ID env var"
 
     await update.message.reply_text(
-        "🧿 *Admin Panel — Sheinverse Bot v16* 🧿\n"
+        "🧿 *Admin Panel — Sheinverse Bot v17* 🧿\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📢 Channel 1: `{CHANNEL_1}`\n"
         f"📢 Channel 2: `{CHANNEL_2}`\n"
@@ -815,11 +990,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱️ Interval: every `{_state['interval']}s`\n"
         f"🔭 Monitor: *{status_icon}*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🪄 *How it works (v16):*\n"
-        "• Pages fetched 0-indexed (page 0 = first)\n"
-        "• Listed products treated as in-stock\n"
-        "• New product → 🆕 alert sent\n"
-        "• Disappeared then reappears → 🔄 alert sent\n\n"
+        "🪄 *How it works (v17):*\n"
+        "• Real size detection via HTML scraping 🔍\n"
+        "• Shows actual sizes: XS • S • M • L • XL • XXL\n"
+        "• HTML only fetched for NEW products (fast!)\n"
+        "• Restock: product disappears → reappears → alert\n\n"
         "👑 *Admin commands:*\n"
         "/startmonitor /stopmonitor /monitor /stats\n"
         "/sortbyrelevance /sortbydiscount /setmonitorinterval\n\n"
@@ -850,7 +1025,7 @@ async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fc_line = "⏳ Not started"
 
     await update.message.reply_text(
-        "🔭 *Monitor Dashboard* 🔭\n"
+        "🔭 *Monitor Dashboard v17* 🔭\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{status_emoji} Status: *{'🟢 Running' if _state['monitor_running'] else '🔴 Stopped'}*\n"
         f"⚙️ Sort: `{sort_label}`\n"
@@ -862,7 +1037,8 @@ async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "*Last Cycle:*\n"
         f"🕐 Time: `{_state['last_poll_time'] or 'No cycle yet'}`\n"
-        f"⚡ Listing fetch: `{_state['last_listing_secs']}s`\n"
+        f"📡 Listing fetch: `{_state['last_listing_secs']}s`\n"
+        f"🔍 HTML fetch: `{_state['last_html_secs']}s` ({_state['last_html_fetched']} products)\n"
         f"📦 Products: `{_state['last_total_products']}`\n"
         f"✨ New alerts: `{_state['last_new_alerted']}`\n"
         f"🎉 Restock alerts: `{_state['last_restock_alerted']}`\n"
@@ -889,9 +1065,9 @@ async def cmd_startmonitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _start_monitor(context.application)
     group_note = f"\n📣 Group alerts: `{_group_id}`" if _group_id else "\n⚠️ Set ALERT\\_GROUP\\_ID for group alerts"
     await update.message.reply_text(
-        "🚀 *Monitor started!* ✨\n\n"
+        "🚀 *Monitor v17 started!* ✨\n\n"
         f"⏱️ First alert in `{_state['interval']}s`\n"
-        f"📦 Will fetch all pages (0-indexed)\n"
+        f"🔍 HTML scraping for real size data\n"
         f"📣 Channels: `{CHANNEL_1}`, `{CHANNEL_2}`"
         f"{group_note}",
         parse_mode="Markdown",
@@ -950,7 +1126,9 @@ async def cmd_setmonitorinterval(update: Update, context: ContextTypes.DEFAULT_T
     if not args:
         await update.message.reply_text(
             f"⚠️ *Usage:* `/setmonitorinterval <seconds>`\n\n"
-            f"⏱️ Current: `{_state['interval']}s` | Min: `10` | Recommended: `60-300`",
+            f"⏱️ Current: `{_state['interval']}s`\n"
+            f"⚠️ Recommended minimum: `{MIN_INTERVAL}s` (HTML scraping needs time)\n"
+            f"✅ Best: `60-300s`",
             parse_mode="Markdown",
         )
         return
@@ -968,8 +1146,12 @@ async def cmd_setmonitorinterval(update: Update, context: ContextTypes.DEFAULT_T
     old = _state["interval"]
     _state["interval"] = new_interval
     _start_monitor(context.application)
+    warning = (
+        f"\n⚠️ _Below {MIN_INTERVAL}s — HTML scraping may not complete in time._"
+        if new_interval < MIN_INTERVAL else ""
+    )
     await update.message.reply_text(
-        f"⏱️ *Interval updated!*\n`{old}s` → `{new_interval}s` | Monitor restarted.",
+        f"⏱️ *Interval updated!*\n`{old}s` → `{new_interval}s` | Monitor restarted.{warning}",
         parse_mode="Markdown",
     )
 
@@ -1064,7 +1246,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_alerts = _state["new_alerts_sent"] + _state["restock_alerts_sent"]
     sort_label   = "Relevance" if _state["sort_mode"] == SORT_RELEVANCE else "Discount ↓"
     await update.message.reply_text(
-        "📊 *Bot Stats — Sheinverse v16* 🚀\n"
+        "📊 *Bot Stats — Sheinverse v17* 🚀\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🕐 Started: `{_state['monitor_started'] or 'not yet'}`\n"
         f"⚙️ Sort: `{sort_label}`\n"
@@ -1138,7 +1320,7 @@ async def post_init(application: Application):
         scope=BotCommandScopeDefault(),
     )
     _start_monitor(application)
-    print(f"{GREEN}[bot] Ready — v16{RESET}")
+    print(f"{GREEN}[bot] Ready — v17 (real size detection via HTML scraping){RESET}")
     print(f"{GREEN}[bot] Alert destinations: {ALERT_CHANNELS}{RESET}")
     if not _group_id:
         print(f"{YELLOW}[bot] WARNING: ALERT_GROUP_ID not set!{RESET}")
@@ -1147,13 +1329,16 @@ async def post_init(application: Application):
 
 
 def main():
-    print(f"{CYAN}{'='*50}{RESET}")
-    print(f"{CYAN}  SHEIN Sheinverse Bot v16{RESET}")
+    print(f"{CYAN}{'='*55}{RESET}")
+    print(f"{CYAN}  SHEIN Sheinverse Bot v17{RESET}")
+    print(f"{CYAN}  Real size detection via HTML scraping{RESET}")
     print(f"{CYAN}  Pages: 0-indexed (0=first, 1=second, ...){RESET}")
     print(f"{CYAN}  Alert destinations: {ALERT_CHANNELS}{RESET}")
     if not _group_id:
         print(f"{YELLOW}  WARNING: Set ALERT_GROUP_ID to send alerts to group!{RESET}")
-    print(f"{CYAN}{'='*50}{RESET}")
+    if _state["interval"] < MIN_INTERVAL:
+        print(f"{YELLOW}  WARNING: interval={_state['interval']}s — recommend {MIN_INTERVAL}s+{RESET}")
+    print(f"{CYAN}{'='*55}{RESET}")
 
     app = (
         ApplicationBuilder()
