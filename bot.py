@@ -822,25 +822,18 @@ async def _monitor_loop(app: Application):
                     current_map[code] = p
             current_codes = set(current_map.keys())
 
-            # Find brand-new products (never seen before)
-            new_product_codes = [c for c in current_codes if c not in _known_codes]
-
-            # ── HTML FETCH FOR NEW PRODUCTS ───────────────────────────────
-            new_stock_maps: dict[str, dict[str, str]] = {}
-            if new_product_codes:
-                new_products_list = [current_map[c] for c in new_product_codes]
-                print(f"{CYAN}[monitor] {len(new_product_codes)} new products — fetching HTML...{RESET}")
-                html_t0 = time.monotonic()
-                new_stock_maps = await asyncio.to_thread(
-                    _fetch_real_stock_maps_parallel, new_products_list
-                )
-                html_elapsed_inner = time.monotonic() - html_t0
-                _state["last_html_fetched"] = len(new_product_codes)
-                _state["last_html_secs"]    = round(html_elapsed_inner, 1)
-                print(f"{GREEN}[monitor] HTML done in {html_elapsed_inner:.1f}s{RESET}")
-            else:
-                _state["last_html_fetched"] = 0
-                _state["last_html_secs"]    = 0.0
+            # ── HTML FETCH FOR ALL PRODUCTS ───────────────────────────────
+            # Scrape every product every cycle for real per-size stock data
+            all_products_list = list(current_map.values())
+            print(f"{CYAN}[monitor] Fetching HTML for ALL {len(all_products_list)} products...{RESET}")
+            html_t0 = time.monotonic()
+            all_stock_maps = await asyncio.to_thread(
+                _fetch_real_stock_maps_parallel, all_products_list
+            )
+            html_elapsed_inner = time.monotonic() - html_t0
+            _state["last_html_fetched"] = len(all_products_list)
+            _state["last_html_secs"]    = round(html_elapsed_inner, 1)
+            print(f"{GREEN}[monitor] HTML done in {html_elapsed_inner:.1f}s{RESET}")
 
             new_alerted     = 0
             restock_alerted = 0
@@ -849,22 +842,23 @@ async def _monitor_loop(app: Application):
                 old_stock_map = _stock_snapshot.get(code, {})
                 is_brand_new  = code not in _known_codes
 
+                # Get real stock map from HTML (fallback to listing sentinel)
+                new_stock_map = all_stock_maps.get(code) or _get_variant_stock_map_from_listing(product)
+
                 if is_brand_new:
-                    # ── NEW PRODUCT — use HTML stock map ──────────────────
+                    # ── NEW PRODUCT ───────────────────────────────────────
                     _known_codes.add(code)
-                    stock_map = new_stock_maps.get(code) or _get_variant_stock_map_from_listing(product)
-                    _stock_snapshot[code] = stock_map
+                    _stock_snapshot[code] = new_stock_map
 
                     in_stock_sizes = [
-                        size for size, status in stock_map.items()
-                        if status in _IN_STOCK_STATUSES
+                        s for s, st in new_stock_map.items()
+                        if st in _IN_STOCK_STATUSES
                     ]
-
                     if in_stock_sizes:
                         real = [s for s in in_stock_sizes if not s.startswith("__")]
                         name = product.get("name", "?")[:40]
                         print(f"{GREEN}[monitor] NEW: {code} | {name} | sizes={real or 'available'}{RESET}")
-                        caption   = _format_new_alert(product, stock_map)
+                        caption   = _format_new_alert(product, new_stock_map)
                         image_url = _get_product_image(product)
                         sent_ok   = await _send_alert(app, caption, image_url, code)
                         _alerted_new.add(code)
@@ -876,35 +870,45 @@ async def _monitor_loop(app: Application):
                         print(f"{YELLOW}[monitor] New but OOS: {code}{RESET}")
 
                 else:
-                    # ── KNOWN PRODUCT — restock detection ─────────────────
-                    # Update listing sentinel for this cycle
-                    listing_map = _get_variant_stock_map_from_listing(product)
+                    # ── KNOWN PRODUCT — per-size restock detection ────────
+                    _stock_snapshot[code] = new_stock_map
 
-                    # Was product OOS (disappeared) and now back?
-                    old_was_oos = old_stock_map and not any(
-                        st in _IN_STOCK_STATUSES for st in old_stock_map.values()
-                    )
-                    now_in_stock = any(
-                        st in _IN_STOCK_STATUSES for st in listing_map.values()
-                    )
+                    # Find sizes that went from outOfStock/missing → inStock
+                    restocked_sizes = []
+                    for size, new_status in new_stock_map.items():
+                        if size.startswith("__"):
+                            continue
+                        if new_status not in _IN_STOCK_STATUSES:
+                            continue
+                        old_status = old_stock_map.get(size, "outOfStock")
+                        if old_status not in _IN_STOCK_STATUSES:
+                            restocked_sizes.append(size)
 
-                    if old_was_oos and now_in_stock:
-                        # Product is back — fetch real HTML for accurate sizes
+                    # Also check: product disappeared then reappeared (sentinel case)
+                    if not restocked_sizes:
+                        old_was_oos = old_stock_map and not any(
+                            st in _IN_STOCK_STATUSES for st in old_stock_map.values()
+                        )
+                        now_in_stock = any(
+                            st in _IN_STOCK_STATUSES for st in new_stock_map.values()
+                        )
+                        if old_was_oos and now_in_stock:
+                            restocked_sizes = [
+                                s for s, st in new_stock_map.items()
+                                if st in _IN_STOCK_STATUSES and not s.startswith("__")
+                            ]
+
+                    if restocked_sizes:
                         name = product.get("name", "?")[:40]
-                        print(f"{GREEN}[monitor] RESTOCK: {code} | {name} — fetching HTML{RESET}")
-                        real_map = await asyncio.to_thread(_fetch_real_stock_map, product)
-                        _stock_snapshot[code] = real_map
-                        caption   = _format_restock_alert(product, real_map)
+                        print(f"{GREEN}[monitor] RESTOCK: {code} | {name} | sizes={restocked_sizes}{RESET}")
+                        caption   = _format_restock_alert(product, new_stock_map)
                         image_url = _get_product_image(product)
                         sent_ok   = await _send_alert(app, caption, image_url, code)
                         if sent_ok:
                             _state["restock_alerts_sent"] += 1
                             restock_alerted += 1
-                    else:
-                        # Just update snapshot with listing sentinel
-                        _stock_snapshot[code] = listing_map
 
-            # Mark disappeared products as OOS (don't delete — needed for restock detection)
+            # Mark disappeared products as OOS — keep in snapshot for restock detection
             disappeared = _known_codes - current_codes
             for code in disappeared:
                 _stock_snapshot[code] = {"__listed__": "outOfStock"}
