@@ -21,10 +21,10 @@ ENV VARS REQUIRED:
   BOT_TOKEN        - Telegram bot token
   ADMIN_USER_ID    - Your Telegram user ID (numeric)
 
-ENV VARS OPTIONAL:
-  ALERT_CHANNEL_1  - default @shein30sec
-  ALERT_CHANNEL_2  - default @helpinghands2s
-  ALERT_GROUP_ID   - Your group chat ID e.g. -1001234567890
+ENV VARS OPTIONAL (provide any combination):
+  ALERT_CHANNEL_1  - e.g. @yourchannel1
+  ALERT_CHANNEL_2  - e.g. @yourchannel2
+  ALERT_GROUP_ID   - e.g. @yourgroup or -1001234567890
 """
 
 import os
@@ -63,15 +63,22 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
 BASE_URL     = "https://www.sheinindia.in"
 CATEGORY_API = BASE_URL + "/api/category/sverse-5939-37961"
 
-# Alert destinations
-CHANNEL_1 = os.environ.get("ALERT_CHANNEL_1", "@shein30sec")
-CHANNEL_2 = os.environ.get("ALERT_CHANNEL_2", "@helpinghands2s")
-REQUIRED_CHANNELS = [CHANNEL_1, CHANNEL_2]
+# Alert destinations — fully dynamic, no hardcoded defaults
+# Set any combination of ALERT_CHANNEL_1, ALERT_CHANNEL_2, ALERT_GROUP_ID
+# At least one must be set or alerts won't go anywhere
+_ch1      = os.environ.get("ALERT_CHANNEL_1", "").strip()
+_ch2      = os.environ.get("ALERT_CHANNEL_2", "").strip()
+_group_id = os.environ.get("ALERT_GROUP_ID",  "").strip()
 
-_group_id = os.environ.get("ALERT_GROUP_ID", "").strip()
-ALERT_CHANNELS: list[str] = [CHANNEL_1, CHANNEL_2]
-if _group_id:
-    ALERT_CHANNELS.append(_group_id)
+ALERT_CHANNELS: list[str] = [ch for ch in [_ch1, _ch2, _group_id] if ch]
+
+# Channels used for membership gate (/sendlinks access check)
+# Only includes CHANNEL_1 and CHANNEL_2 (not group)
+REQUIRED_CHANNELS: list[str] = [ch for ch in [_ch1, _ch2] if ch]
+
+if not ALERT_CHANNELS:
+    print("\033[91m[config] WARNING: No alert destinations set! "
+          "Set ALERT_CHANNEL_1, ALERT_CHANNEL_2, or ALERT_GROUP_ID.\033[0m")
 
 # ── FETCH SETTINGS ────────────────────────────────────────────────────────────
 PAGE_SIZE          = 45
@@ -763,8 +770,10 @@ async def _monitor_loop(app: Application):
         print(f"{YELLOW}[monitor] WARNING: interval={_state['interval']}s is below {MIN_INTERVAL}s. "
               f"Recommended 60-300s for HTML scraping.{RESET}")
 
+    if not ALERT_CHANNELS:
+        print(f"{RED}[monitor] WARNING: No alert destinations set! Bot will run but send nowhere.{RESET}")
     if not _group_id:
-        print(f"{YELLOW}[monitor] WARNING: ALERT_GROUP_ID not set!{RESET}")
+        print(f"{YELLOW}[monitor] No ALERT_GROUP_ID set — group alerts disabled.{RESET}")
 
     try:
         while True:
@@ -978,13 +987,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sort_label  = "Relevance" if _state["sort_mode"] == SORT_RELEVANCE else "Discount ↓"
     status_icon = "🟢 Running" if _state["monitor_running"] else "🔴 Stopped"
-    group_line  = f"`{_group_id}`" if _group_id else "❌ Not set — set ALERT\\_GROUP\\_ID env var"
+    group_line = f"`{_group_id}`" if _group_id else "❌ Not set"
+    ch_lines   = "\n".join(f"📢 Channel {i+1}: `{ch}`" for i, ch in enumerate([_ch1, _ch2]) if ch)
+    if not ch_lines:
+        ch_lines = "⚠️ No channels set"
 
     await update.message.reply_text(
         "🧿 *Admin Panel — Sheinverse Bot v17* 🧿\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📢 Channel 1: `{CHANNEL_1}`\n"
-        f"📢 Channel 2: `{CHANNEL_2}`\n"
+        f"{ch_lines}\n"
         f"📣 Alert Group: {group_line}\n\n"
         f"⚙️ Sort mode: `{sort_label}`\n"
         f"⏱️ Interval: every `{_state['interval']}s`\n"
@@ -1063,12 +1074,13 @@ async def cmd_startmonitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     _start_monitor(context.application)
-    group_note = f"\n📣 Group alerts: `{_group_id}`" if _group_id else "\n⚠️ Set ALERT\\_GROUP\\_ID for group alerts"
+    dest_line  = f"`{'`, `'.join(ALERT_CHANNELS)}`" if ALERT_CHANNELS else "⚠️ None set!"
+    group_note = f"\n📣 Group: `{_group_id}`" if _group_id else ""
     await update.message.reply_text(
         "🚀 *Monitor v17 started!* ✨\n\n"
         f"⏱️ First alert in `{_state['interval']}s`\n"
         f"🔍 HTML scraping for real size data\n"
-        f"📣 Channels: `{CHANNEL_1}`, `{CHANNEL_2}`"
+        f"📣 Destinations: {dest_line}"
         f"{group_note}",
         parse_mode="Markdown",
         reply_markup=_admin_keyboard(),
@@ -1221,10 +1233,11 @@ async def cmd_sendlinks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ch_list = "\n".join(f"   🔔 {ch}" for ch in REQUIRED_CHANNELS) if REQUIRED_CHANNELS else "   _(no channels configured)_"
     await update.message.reply_text(
         "✨ *Welcome to SHEIN Sheinverse Bot!* 🛍️✨\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"1️⃣ Join both channels:\n   🔔 {CHANNEL_1}\n   🔔 {CHANNEL_2}\n\n"
+        f"1️⃣ Join the channels:\n{ch_list}\n\n"
         "2️⃣ DM this bot: /sendlinks\n"
         "3️⃣ Get sorted product files! 🎉\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1232,8 +1245,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 /help      — This message\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🔔 *Auto alerts in channels:*\n"
-        "✨ New product listed → instant alert\n"
-        "🚀 Product restocked → instant alert\n\n"
+        "✨ New product listed → alert with sizes\n"
+        "🚀 Product restocked → alert with sizes\n\n"
         "💜 _Stay tuned — we never miss a drop!_",
         parse_mode="Markdown",
     )
@@ -1322,8 +1335,10 @@ async def post_init(application: Application):
     _start_monitor(application)
     print(f"{GREEN}[bot] Ready — v17 (real size detection via HTML scraping){RESET}")
     print(f"{GREEN}[bot] Alert destinations: {ALERT_CHANNELS}{RESET}")
+    if not ALERT_CHANNELS:
+        print(f"{RED}[bot] WARNING: No alert destinations set!{RESET}")
     if not _group_id:
-        print(f"{YELLOW}[bot] WARNING: ALERT_GROUP_ID not set!{RESET}")
+        print(f"{YELLOW}[bot] ALERT_GROUP_ID not set — group alerts disabled.{RESET}")
     else:
         print(f"{GREEN}[bot] Group alerts → {_group_id}{RESET}")
 
@@ -1334,8 +1349,10 @@ def main():
     print(f"{CYAN}  Real size detection via HTML scraping{RESET}")
     print(f"{CYAN}  Pages: 0-indexed (0=first, 1=second, ...){RESET}")
     print(f"{CYAN}  Alert destinations: {ALERT_CHANNELS}{RESET}")
+    if not ALERT_CHANNELS:
+        print(f"{RED}  WARNING: No alert destinations set! Set at least one env var.{RESET}")
     if not _group_id:
-        print(f"{YELLOW}  WARNING: Set ALERT_GROUP_ID to send alerts to group!{RESET}")
+        print(f"{YELLOW}  ALERT_GROUP_ID not set — group alerts disabled.{RESET}")
     if _state["interval"] < MIN_INTERVAL:
         print(f"{YELLOW}  WARNING: interval={_state['interval']}s — recommend {MIN_INTERVAL}s+{RESET}")
     print(f"{CYAN}{'='*55}{RESET}")
